@@ -63,16 +63,23 @@ jobs:
 
       - name: Analyse
         run: |
-          mkdir -p inspect
+          mkdir -p inspect/smali
           python3 - <<'PY' > inspect/report.txt
-          import re, glob, os
+          import re, glob, os, shutil
 
           SRC = 'work/src'
+          OUT_SMALI = 'inspect/smali'
           layouts = sorted(glob.glob(f'{SRC}/res/layout*/*.xml'))
 
           # public.xml: layout name -> hex id
           pub = open(f'{SRC}/res/values/public.xml', errors='ignore').read()
           layout_ids = dict(re.findall(r'<public type="layout" name="([^"]+)" id="(0x[0-9a-fA-F]+)"', pub))
+
+          def copy_smali(path):
+              rel = os.path.relpath(path, SRC)
+              dst = os.path.join(OUT_SMALI, rel)
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              shutil.copy(path, dst)
 
           print("=== 1. Layouts with an element id/icon_frame (tag shown) ===")
           cands = []
@@ -116,9 +123,45 @@ jobs:
 
           print("=== 6. setLayoutResource in dashboard/tile/homepage smali ===")
           print(os.popen(f"grep -rn 'setLayoutResource' {SRC}/smali* 2>/dev/null | grep -i 'tile\\|dashboard\\|homepage\\|google' | head -60").read())
+
+          print("=== 7. Smali files using the card layouts and op_preference_material (R classes excluded) ===")
+          targets = [
+              'op_home_preference_card_top',
+              'op_home_preference_card_middle',
+              'op_home_preference_card_bottom',
+              'op_preference_material',
+          ]
+          copied = set()
+          for name in targets:
+              hid = layout_ids.get(name)
+              print(f"--- {name} ({hid}) ---")
+              if not hid:
+                  print("  (id not found in public.xml)")
+                  continue
+              out = os.popen(f"grep -rn -i '{hid}' {SRC}/smali* 2>/dev/null | grep -v '/R\\$' | head -40").read()
+              print(out or "  (no references)")
+              for line in out.splitlines():
+                  path = line.split(':', 1)[0]
+                  if os.path.isfile(path):
+                      copied.add(path)
+          print()
+
+          # Always include the homepage code and DashboardFragment
+          for d in glob.glob(f'{SRC}/smali*/com/android/settings/homepage'):
+              for root, _, files in os.walk(d):
+                  for fn in files:
+                      copied.add(os.path.join(root, fn))
+          for p in glob.glob(f'{SRC}/smali*/com/android/settings/dashboard/DashboardFragment*.smali'):
+              copied.add(p)
+
+          for p in sorted(copied):
+              copy_smali(p)
+          print(f"Copied {len(copied)} smali files to inspect/smali")
           PY
           wc -l inspect/report.txt
-          head -120 inspect/report.txt
+          head -150 inspect/report.txt
+          echo "---- smali files collected ----"
+          find inspect/smali -type f | head -100
 
       - name: Collect resources
         run: |
