@@ -1,0 +1,145 @@
+name: Settings.apk inspect / patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (empty = latest release)"
+        required: false
+        default: ""
+      asset:
+        description: "APK name in the release assets"
+        required: true
+        default: "Settings.apk"
+      decompile_smali:
+        description: "Also decompile smali (slower, bigger)"
+        type: boolean
+        default: false
+      patch:
+        description: "Apply patches/*.patch, rebuild and zip the patched APK"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  APKTOOL_VERSION: "2.9.3"
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ASSET: ${{ inputs.asset }}
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download APK from this repo's release
+        run: |
+          mkdir -p work
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" -R "${{ github.repository }}" -p "$ASSET" -D work --clobber
+          else
+            gh release download -R "${{ github.repository }}" -p "$ASSET" -D work --clobber
+          fi
+          ls -lh work
+
+      - name: Install apktool and zipalign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zipalign
+          curl -fL -o apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          printf '#!/bin/sh\nexec java -Xmx3g -jar "%s/apktool.jar" "$@"\n' "$PWD" | sudo tee /usr/local/bin/apktool >/dev/null
+          sudo chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: Install ROM framework APKs (optional)
+        run: |
+          # Put framework-res.apk, oplus/oneplus framework APKs in frameworks/ in the repo
+          if ls frameworks/*.apk >/dev/null 2>&1; then
+            for f in frameworks/*.apk; do apktool if "$f"; done
+          else
+            echo "No frameworks/ folder, using apktool's default framework"
+          fi
+
+      - name: Decompile
+        run: |
+          cd work
+          FLAGS=""
+          if [ "${{ inputs.decompile_smali }}" != "true" ]; then FLAGS="-s"; fi
+          apktool d $FLAGS "$ASSET" -o src -f
+
+      - name: Build inspection report
+        run: |
+          mkdir -p inspect
+          cd work
+          python3 - <<'PY' > ../inspect/report.txt
+          import re, glob
+          print("== Layouts where @id/icon_frame is on a LinearLayout ==")
+          for f in sorted(glob.glob('src/res/layout*/*.xml')):
+              s = open(f, errors='ignore').read()
+              for m in re.finditer(r'<([\w.]+)[^>]*?@(?:\+)?id/icon_frame', s, re.S):
+                  print(f"{f}  ->  <{m.group(1)}>")
+          print()
+          print("== Files mentioning google in res/xml ==")
+          for f in sorted(glob.glob('src/res/xml*/*.xml')):
+              s = open(f, errors='ignore').read()
+              for m in re.finditer(r'.*google.*', s, re.I):
+                  print(f"{f}: {m.group(0).strip()[:200]}")
+          PY
+          grep -rn "setLayoutResource" src/smali*/ 2>/dev/null | grep -i "tile\|dashboard\|homepage" | head -50 > ../inspect/smali_layout_calls.txt || true
+          cat ../inspect/report.txt
+
+      - name: Collect text resources
+        run: |
+          cd work/src
+          mkdir -p ../../inspect/res
+          cp AndroidManifest.xml ../../inspect/ 2>/dev/null || true
+          for d in res/layout* res/xml* res/values*; do
+            [ -d "$d" ] && cp -r --parents "$d" ../../inspect/
+          done
+          cd ../..
+          zip -qr inspect.zip inspect
+          ls -lh inspect.zip
+
+      - name: Upload inspect artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspect
+          path: inspect.zip
+          if-no-files-found: error
+
+      - name: Apply patches and rebuild
+        if: ${{ inputs.patch }}
+        run: |
+          cd work
+          if ls ../patches/*.patch >/dev/null 2>&1; then
+            for p in ../patches/*.patch; do
+              echo "Applying $p"
+              patch -p1 -d src < "$p"
+            done
+          else
+            echo "No patches/*.patch found"
+          fi
+          apktool b src -o patched.apk --use-aapt2
+          zipalign -p -f 4 patched.apk "$ASSET"
+          rm -f patched.apk
+
+      - name: Create Settings.zip
+        run: |
+          cd work
+          zip -9 ../Settings.zip "$ASSET"
+
+      - name: Upload Settings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Settings
+          path: Settings.zip
+          if-no-files-found: error
