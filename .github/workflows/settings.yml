@@ -1,4 +1,4 @@
-name: Settings.apk inspect
+name: Settings.apk patch and inspect
 
 on:
   workflow_dispatch:
@@ -11,6 +11,10 @@ on:
         description: "APK name in the release assets"
         required: true
         default: "Settings.apk"
+      run_inspect:
+        description: "Also run the inspect job (decode resources, make inspect.zip)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,7 +26,7 @@ env:
   TAG: ${{ inputs.tag }}
 
 jobs:
-  inspect:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,37 +52,78 @@ jobs:
             "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
           printf '#!/bin/sh\nexec java -Xmx3g -jar "%s/apktool.jar" "$@"\n' "$PWD" | sudo tee /usr/local/bin/apktool >/dev/null
           sudo chmod +x /usr/local/bin/apktool
+          apktool --version
 
-      - name: Install ROM framework APKs (optional)
+      - name: Install zipalign
         run: |
-          # Optional: put framework-res.apk and oplus/oneplus framework APKs in frameworks/
-          if ls frameworks/*.apk >/dev/null 2>&1; then
-            for f in frameworks/*.apk; do apktool if "$f"; done
+          if ! command -v zipalign >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y zipalign
           fi
+          command -v zipalign
 
-      - name: Decompile (resources and smali)
+      # ---------- PATCH BUILD (code only, resources are left untouched) ----------
+
+      - name: Decompile code only (no resources)
         run: |
           cd work
-          apktool d "$ASSET" -o src -f
+          apktool d -r -f "$ASSET" -o src_nores
+          ls src_nores
 
       - name: Patch Google tile layout
         run: |
-          python3 fix_google_tile.py work/src/smali/com/android/settings/dashboard/DashboardFragment.smali
+          F=work/src_nores/smali/com/android/settings/dashboard/DashboardFragment.smali
+          if [ ! -f "$F" ]; then
+            echo "DashboardFragment.smali not found, searching..."
+            F=$(find work/src_nores -name DashboardFragment.smali | head -1)
+          fi
+          echo "Patching: $F"
+          python3 fix_google_tile.py "$F"
+          grep -n "top_level_google\|cond_gms_card" "$F"
 
-      - name: Rebuild and zip
+      - name: Rebuild patched APK
         run: |
           cd work
-          apktool b src -o patched.apk --use-aapt2
-          zipalign -p -f 4 patched.apk "$ASSET"
-          zip -9 ../Settings-patched.zip "$ASSET"
+          apktool b src_nores -o patched.apk
+          mkdir -p out
+          zipalign -p -f 4 patched.apk out/Settings.apk
+          unzip -tq out/Settings.apk
+          echo "---- contents check ----"
+          unzip -v out/Settings.apk | grep -E "classes[0-9]*\.dex|resources\.arsc|AndroidManifest\.xml"
+          if ! unzip -l out/Settings.apk | grep -q "resources.arsc"; then
+            echo "ERROR: resources.arsc missing from rebuilt APK"
+            exit 1
+          fi
+          cd out
+          zip -9 ../../Settings-patched.zip Settings.apk
+          cd ../..
+          ls -lh Settings-patched.zip
 
       - name: Upload patched artifact
         uses: actions/upload-artifact@v4
         with:
           name: Settings-patched
           path: Settings-patched.zip
+          if-no-files-found: error
+
+      # ---------- OPTIONAL INSPECT (decodes resources, only if run_inspect is on) ----------
+
+      - name: Install ROM framework APKs (optional)
+        if: ${{ inputs.run_inspect }}
+        run: |
+          # Optional: put framework-res.apk and oplus/oneplus framework APKs in frameworks/
+          if ls frameworks/*.apk >/dev/null 2>&1; then
+            for f in frameworks/*.apk; do apktool if "$f"; done
+          fi
+
+      - name: Decompile with resources (inspect only)
+        if: ${{ inputs.run_inspect }}
+        run: |
+          cd work
+          apktool d "$ASSET" -o src -f
 
       - name: Analyse
+        if: ${{ inputs.run_inspect }}
         run: |
           mkdir -p inspect/smali
           python3 - <<'PY' > inspect/report.txt
@@ -181,6 +226,7 @@ jobs:
           find inspect/smali -type f | head -100
 
       - name: Collect resources
+        if: ${{ inputs.run_inspect }}
         run: |
           cd work/src
           cp AndroidManifest.xml ../../inspect/ || true
@@ -192,6 +238,7 @@ jobs:
           ls -lh inspect.zip
 
       - name: Upload report
+        if: ${{ inputs.run_inspect }}
         uses: actions/upload-artifact@v4
         with:
           name: inspect
