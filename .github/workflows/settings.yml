@@ -80,20 +80,41 @@ jobs:
           echo "Patching: $F"
           python3 fix_google_tile.py "$F"
           grep -n "top_level_google\|cond_gms_card" "$F"
+          # which dex file holds this class? smali/ = classes.dex, smali_classesN/ = classesN.dex
+          DEX=classes.dex
+          case "$F" in
+            */smali_classes*/*)
+              N=$(echo "$F" | sed -E 's|.*/smali_classes([0-9]+)/.*|\1|')
+              DEX="classes${N}.dex"
+              ;;
+          esac
+          echo "Patched class lives in: $DEX"
+          echo "PATCHED_DEX=$DEX" >> "$GITHUB_ENV"
 
-      - name: Rebuild patched APK
+      - name: Rebuild patched APK (original APK + replaced dex only)
         run: |
           cd work
+          # 1. build with apktool only to get a freshly compiled dex
           apktool b src_nores -o patched.apk
+          mkdir -p dexout
+          unzip -o -q patched.apk "$PATCHED_DEX" -d dexout
+          ls -l dexout
+
+          # 2. put that single dex into a copy of the ORIGINAL apk
+          #    (everything else stays byte-for-byte: META-INF, resources.arsc, manifest, other dex)
+          cp "$ASSET" base.apk
+          (cd dexout && zip -0 ../base.apk "$PATCHED_DEX")
+
+          # 3. align
           mkdir -p out
-          zipalign -p -f 4 patched.apk out/Settings.apk
+          zipalign -p -f 4 base.apk out/Settings.apk
           unzip -tq out/Settings.apk
-          echo "---- contents check ----"
-          unzip -v out/Settings.apk | grep -E "classes[0-9]*\.dex|resources\.arsc|AndroidManifest\.xml"
-          if ! unzip -l out/Settings.apk | grep -q "resources.arsc"; then
-            echo "ERROR: resources.arsc missing from rebuilt APK"
-            exit 1
-          fi
+
+          echo "---- original vs patched ----"
+          unzip -v "$ASSET" | grep -E "classes[0-9]*\.dex|resources\.arsc|AndroidManifest\.xml|CERT\.(RSA|SF)|MANIFEST\.MF"
+          echo "-----"
+          unzip -v out/Settings.apk | grep -E "classes[0-9]*\.dex|resources\.arsc|AndroidManifest\.xml|CERT\.(RSA|SF)|MANIFEST\.MF"
+
           cd out
           zip -9 ../../Settings-patched.zip Settings.apk
           cd ../..
