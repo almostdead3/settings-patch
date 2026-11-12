@@ -61,6 +61,23 @@ jobs:
           cd work
           apktool d "$ASSET" -o src -f
 
+      - name: Patch Google tile layout
+        run: |
+          python3 fix_google_tile.py work/src/smali/com/android/settings/dashboard/DashboardFragment.smali
+
+      - name: Rebuild and zip
+        run: |
+          cd work
+          apktool b src -o patched.apk --use-aapt2
+          zipalign -p -f 4 patched.apk "$ASSET"
+          zip -9 ../Settings-patched.zip "$ASSET"
+
+      - name: Upload patched artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Settings-patched
+          path: Settings-patched.zip
+
       - name: Analyse
         run: |
           mkdir -p inspect/smali
