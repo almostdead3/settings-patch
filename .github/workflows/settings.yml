@@ -258,6 +258,19 @@ jobs:
           zip -qr inspect.zip inspect
           ls -lh inspect.zip
 
+      - name: Collect account-related smali (small, for token/card analysis)
+        if: ${{ inputs.run_inspect }}
+        run: |
+          mkdir -p account_smali
+          cd work/src
+          # smali uses slashes in class names, so match com/oneplus/account
+          grep -rlE "get_account_o_token|com/oneplus/account|oplustoken|heytap|op_security_uuid" smali* 2>/dev/null \
+            | while read -r f; do cp --parents "$f" ../../account_smali/; done || true
+          cd ../..
+          find account_smali -type f | head -200
+          zip -qr account_smali.zip account_smali || true
+          ls -lh account_smali.zip || true
+
       - name: Upload report
         if: ${{ inputs.run_inspect }}
         uses: actions/upload-artifact@v4
@@ -265,3 +278,11 @@ jobs:
           name: inspect
           path: inspect.zip
           if-no-files-found: error
+
+      - name: Upload account smali
+        if: ${{ inputs.run_inspect }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: account-smali
+          path: account_smali.zip
+          if-no-files-found: warn
