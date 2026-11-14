@@ -17,13 +17,9 @@ on:
         required: true
         default: "Settings.apk"
       patch:
-        description: "Which patch script to apply (file in the repo root)"
+        description: "Patch scripts to apply, in order, space separated (files in the repo root: patch_india.py patch_debug.py patch_member.py)"
         required: true
-        default: "patch_debug.py"
-        type: choice
-        options:
-          - patch_debug.py
-          - patch_member.py
+        default: "patch_india.py patch_debug.py"
 
 jobs:
   build:
@@ -62,7 +58,10 @@ jobs:
         run: |
           test -f "dec/smali_classes2/com/oneplus/settings/OPMemberController.smali" \
             || { echo "OPMemberController.smali not found in smali_classes2"; find dec -name 'OPMemberController*.smali'; exit 1; }
-          python3 -I "${{ inputs.patch }}" dec
+          for p in ${{ inputs.patch }}; do
+            echo "== applying $p"
+            python3 -I "$p" dec
+          done
 
       - name: Rebuild and swap classes2.dex into the ORIGINAL apk
         run: |
@@ -72,7 +71,7 @@ jobs:
           # store (no compression) like the original dex entries
           (cd x && zip -0 -q ../patched.apk classes2.dex)
           zipalign -p -f 4 patched.apk Settings-patched.apk
-          unzip -p Settings-patched.apk classes2.dex | strings | grep -c -E "req deviceId=|applyLocalFallback" || true
+          unzip -p Settings-patched.apk classes2.dex | strings | grep -c -E "req deviceId=|applyLocalFallback|india-patched|const/4" || true
           ls -l original.apk Settings-patched.apk
 
       - uses: actions/upload-artifact@v4
