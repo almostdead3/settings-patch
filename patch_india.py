@@ -1,0 +1,80 @@
+name: Settings member debug patch
+
+# Takes Settings.apk from a release of this repo, patches OPMemberController
+# (logs the server reply of the member request) and uploads the result.
+# Only classes2.dex is replaced; everything else (resources, META-INF) stays
+# exactly as in your original APK.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag that holds Settings.apk (empty = latest release)"
+        required: false
+        default: ""
+      asset:
+        description: "APK file name inside the release"
+        required: true
+        default: "Settings.apk"
+      patch:
+        description: "Patch scripts to apply, in order, space separated (files in the repo root: patch_india.py patch_debug.py patch_member.py)"
+        required: true
+        default: "patch_india.py patch_debug.py"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Tools (zipalign, zip, apktool)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zipalign zip unzip binutils
+          curl -fsSL -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Download Settings.apk from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            gh release download "${{ inputs.tag }}" -p "${{ inputs.asset }}" -O original.apk
+          else
+            gh release download -p "${{ inputs.asset }}" -O original.apk
+          fi
+          ls -l original.apk
+          unzip -l original.apk | grep -E "classes[0-9]*\.dex"
+
+      - name: Decode (smali only, resources untouched)
+        run: java -jar apktool.jar d -r -f -o dec original.apk
+
+      - name: Apply patch
+        run: |
+          test -f "dec/smali_classes2/com/oneplus/settings/OPMemberController.smali" \
+            || { echo "OPMemberController.smali not found in smali_classes2"; find dec -name 'OPMemberController*.smali'; exit 1; }
+          for p in ${{ inputs.patch }}; do
+            echo "== applying $p"
+            python3 -I "$p" dec
+          done
+
+      - name: Rebuild and swap classes2.dex into the ORIGINAL apk
+        run: |
+          java -jar apktool.jar b -f -o rebuilt.apk dec
+          mkdir x && cd x && unzip -q ../rebuilt.apk "classes2.dex" && cd ..
+          cp original.apk patched.apk
+          # store (no compression) like the original dex entries
+          (cd x && zip -0 -q ../patched.apk classes2.dex)
+          zipalign -p -f 4 patched.apk Settings-patched.apk
+          unzip -p Settings-patched.apk classes2.dex | strings | grep -c -E "req deviceId=|applyLocalFallback|india-patched|const/4" || true
+          ls -l original.apk Settings-patched.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Settings-patched
+          path: Settings-patched.apk
