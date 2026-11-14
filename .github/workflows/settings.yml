@@ -1,4 +1,4 @@
-name: Settings.apk patch and inspect
+name: Settings account header inspect
 
 on:
   workflow_dispatch:
@@ -11,10 +11,6 @@ on:
         description: "APK name in the release assets"
         required: true
         default: "Settings.apk"
-      run_inspect:
-        description: "Also run the inspect job (decode resources, make inspect.zip)"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -26,7 +22,7 @@ env:
   TAG: ${{ inputs.tag }}
 
 jobs:
-  build:
+  inspect:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,235 +50,116 @@ jobs:
           sudo chmod +x /usr/local/bin/apktool
           apktool --version
 
-      - name: Install zipalign
-        run: |
-          if ! command -v zipalign >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y zipalign
-          fi
-          command -v zipalign
-
-      # ---------- PATCH BUILD (code only, resources are left untouched) ----------
-
-      - name: Decompile code only (no resources)
-        run: |
-          cd work
-          apktool d -r -f "$ASSET" -o src_nores
-          ls src_nores
-
-      - name: Patch Google tile layout
-        run: |
-          F=work/src_nores/smali/com/android/settings/dashboard/DashboardFragment.smali
-          if [ ! -f "$F" ]; then
-            echo "DashboardFragment.smali not found, searching..."
-            F=$(find work/src_nores -name DashboardFragment.smali | head -1)
-          fi
-          echo "Patching: $F"
-          python3 fix_google_tile.py "$F"
-          grep -n "top_level_google\|cond_gms_card" "$F"
-          # which dex file holds this class? smali/ = classes.dex, smali_classesN/ = classesN.dex
-          DEX=classes.dex
-          case "$F" in
-            */smali_classes*/*)
-              N=$(echo "$F" | sed -E 's|.*/smali_classes([0-9]+)/.*|\1|')
-              DEX="classes${N}.dex"
-              ;;
-          esac
-          echo "Patched class lives in: $DEX"
-          echo "PATCHED_DEX=$DEX" >> "$GITHUB_ENV"
-
-      - name: Rebuild patched APK (original APK + replaced dex only)
-        run: |
-          cd work
-          # 1. build with apktool only to get a freshly compiled dex
-          apktool b src_nores -o patched.apk
-          mkdir -p dexout
-          unzip -o -q patched.apk "$PATCHED_DEX" -d dexout
-          ls -l dexout
-
-          # 2. put that single dex into a copy of the ORIGINAL apk
-          #    (everything else stays byte-for-byte: META-INF, resources.arsc, manifest, other dex)
-          cp "$ASSET" base.apk
-          (cd dexout && zip -0 ../base.apk "$PATCHED_DEX")
-
-          # 3. align
-          mkdir -p out
-          zipalign -p -f 4 base.apk out/Settings.apk
-          unzip -tq out/Settings.apk
-
-          echo "---- original vs patched ----"
-          unzip -v "$ASSET" | grep -E "classes[0-9]*\.dex|resources\.arsc|AndroidManifest\.xml|CERT\.(RSA|SF)|MANIFEST\.MF"
-          echo "-----"
-          unzip -v out/Settings.apk | grep -E "classes[0-9]*\.dex|resources\.arsc|AndroidManifest\.xml|CERT\.(RSA|SF)|MANIFEST\.MF"
-
-          cd out
-          zip -9 ../../Settings-patched.zip Settings.apk
-          cd ../..
-          ls -lh Settings-patched.zip
-
-      - name: Upload patched artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Settings-patched
-          path: Settings-patched.zip
-          if-no-files-found: error
-
-      # ---------- OPTIONAL INSPECT (decodes resources, only if run_inspect is on) ----------
-
       - name: Install ROM framework APKs (optional)
-        if: ${{ inputs.run_inspect }}
         run: |
           # Optional: put framework-res.apk and oplus/oneplus framework APKs in frameworks/
           if ls frameworks/*.apk >/dev/null 2>&1; then
             for f in frameworks/*.apk; do apktool if "$f"; done
           fi
 
-      - name: Decompile with resources (inspect only)
-        if: ${{ inputs.run_inspect }}
+      - name: Decompile (resources and smali)
         run: |
           cd work
           apktool d "$ASSET" -o src -f
 
-      - name: Analyse
-        if: ${{ inputs.run_inspect }}
+      - name: Find account / member header code
         run: |
-          mkdir -p inspect/smali
+          mkdir -p inspect/smali_op
           python3 - <<'PY' > inspect/report.txt
           import re, glob, os, shutil
 
           SRC = 'work/src'
-          OUT_SMALI = 'inspect/smali'
-          layouts = sorted(glob.glob(f'{SRC}/res/layout*/*.xml'))
-
-          # public.xml: layout name -> hex id
           pub = open(f'{SRC}/res/values/public.xml', errors='ignore').read()
-          layout_ids = dict(re.findall(r'<public type="layout" name="([^"]+)" id="(0x[0-9a-fA-F]+)"', pub))
+          ids = {}
+          for typ, name, hid in re.findall(r'<public type="(\w+)" name="([^"]+)" id="(0x[0-9a-fA-F]+)"', pub):
+              ids[(typ, name)] = hid.lower()
 
-          def copy_smali(path):
-              rel = os.path.relpath(path, SRC)
-              dst = os.path.join(OUT_SMALI, rel)
-              os.makedirs(os.path.dirname(dst), exist_ok=True)
-              shutil.copy(path, dst)
-
-          print("=== 1. Layouts with an element id/icon_frame (tag shown) ===")
-          cands = []
-          for f in layouts:
-              s = open(f, errors='ignore').read()
-              m = re.search(r'<([\w.]+)((?:(?!<)[\s\S])*?)@(?:\+)?id/icon_frame', s)
-              if m:
-                  root = re.search(r'<([\w.]+)', s).group(1)
-                  print(f"{f.replace(SRC+'/','')}  icon_frame=<{m.group(1)}>  root=<{root}>")
-                  cands.append((f, m.group(1)))
-          print()
-
-          print("=== 2. Same, only where icon_frame is a LinearLayout (suspects) ===")
-          suspects = [f for f, t in cands if t.endswith('LinearLayout')]
-          for f in suspects:
-              print(f.replace(SRC+'/', ''))
-          print()
-
-          print("=== 3. Full text of suspect layouts (max 15) ===")
-          for f in suspects[:15]:
-              print(f"----- {f.replace(SRC+'/','')} -----")
-              print(open(f, errors='ignore').read())
-          print()
-
-          print("=== 4. Smali that references suspect layouts by id ===")
-          for f in suspects:
-              name = os.path.basename(f)[:-4]
-              hid = layout_ids.get(name)
-              if not hid:
-                  continue
-              hits = os.popen(f"grep -rln '{hid}' {SRC}/smali* 2>/dev/null | head -10").read().strip()
-              print(f"{name} ({hid}):\n{hits or '  (no direct smali reference)'}")
-          print()
-
-          print("=== 5. Lines mentioning google in res/xml ===")
-          for f in sorted(glob.glob(f'{SRC}/res/xml*/*.xml')):
-              for line in open(f, errors='ignore'):
-                  if re.search(r'google', line, re.I):
-                      print(f"{f.replace(SRC+'/','')}: {line.strip()[:200]}")
-          print()
-
-          print("=== 6. setLayoutResource in dashboard/tile/homepage smali ===")
-          print(os.popen(f"grep -rn 'setLayoutResource' {SRC}/smali* 2>/dev/null | grep -i 'tile\\|dashboard\\|homepage\\|google' | head -60").read())
-
-          print("=== 7. Smali files using the card layouts and op_preference_material (R classes excluded) ===")
           targets = [
-              'op_home_preference_card_top',
-              'op_home_preference_card_middle',
-              'op_home_preference_card_bottom',
-              'op_preference_material',
+              ('layout',   'op_preference_member'),
+              ('string',   'op_member_title'),
+              ('string',   'op_member_description'),
+              ('string',   'op_oxygen_member_description'),
+              ('string',   'op_china_member_title'),
+              ('string',   'op_china_member_description'),
+              ('string',   'oneplus_member_tag_new'),
+              ('drawable', 'op_ic_member_avatar'),
+              ('drawable', 'op_member_avatar_tag_bg'),
           ]
+          needles = [
+              'com.oneplus.account', 'get_account_info', 'get_account_o_token',
+              'get_account_oneplus_token', 'SKU_CHINA', 'com.heytap', 'com.oneplus.membership',
+          ]
+
+          smali_files = glob.glob(f'{SRC}/smali*/**/*.smali', recursive=True)
+          texts = {}
+          for f in smali_files:
+              try:
+                  texts[f] = open(f, errors='ignore').read()
+              except OSError:
+                  pass
           copied = set()
-          for name in targets:
-              hid = layout_ids.get(name)
-              print(f"--- {name} ({hid}) ---")
-              if not hid:
-                  print("  (id not found in public.xml)")
-                  continue
-              out = os.popen(f"grep -rn -i '{hid}' {SRC}/smali* 2>/dev/null | grep -v '/R\\$' | head -40").read()
-              print(out or "  (no references)")
-              for line in out.splitlines():
-                  path = line.split(':', 1)[0]
-                  if os.path.isfile(path):
-                      copied.add(path)
+
+          def scan(label, needle):
+              hits = [f for f, t in texts.items() if needle in t]
+              print(f"--- {label} ({needle}) : {len(hits)} file(s)")
+              for f in hits[:40]:
+                  print("   ", f.replace(SRC + '/', ''))
+              if len(hits) <= 40:
+                  copied.update(hits)
+
+          print("=== 1. Resource ids used by the account/member card ===")
+          for typ, name in targets:
+              print(f"{typ}/{name} = {ids.get((typ, name), 'NOT FOUND')}")
+          print()
+          print("=== 2. Smali files that use those ids ===")
+          for typ, name in targets:
+              hid = ids.get((typ, name))
+              if hid:
+                  scan(f"{typ}/{name}", hid)
+          print()
+          print("=== 3. Smali files mentioning account provider / China SKU / HeyTap ===")
+          for n in needles:
+              scan("string", n)
           print()
 
-          # Always include the homepage code and DashboardFragment
-          for d in glob.glob(f'{SRC}/smali*/com/android/settings/homepage'):
-              for root, _, files in os.walk(d):
-                  for fn in files:
-                      copied.add(os.path.join(root, fn))
-          for p in glob.glob(f'{SRC}/smali*/com/android/settings/dashboard/DashboardFragment*.smali'):
-              copied.add(p)
+          # when the APK is the OnePlus Account app, also take its provider / auth / util code whole
+          for sub in ['provider', 'util', 'data', 'authenticator', 'tokenauth', 'oneplush']:
+              for f in glob.glob(f'{SRC}/smali*/com/oneplus/account/{sub}/**/*.smali', recursive=True):
+                  copied.add(f)
 
-          for p in sorted(copied):
-              copy_smali(p)
-          print(f"Copied {len(copied)} smali files to inspect/smali")
+          for f in glob.glob(f'{SRC}/smali*/com/oneplus/accountsdk/utils/*.smali'):
+              copied.add(f)
+
+          # when the APK is Settings: the account / member card at the top of the settings list
+          for pattern in ['com/oneplus/settings/**/*Member*.smali',
+                          'com/oneplus/settings/**/*Account*.smali',
+                          'com/oneplus/settings/utils/OPUtils*.smali']:
+              for f in glob.glob(f'{SRC}/smali*/{pattern}', recursive=True):
+                  copied.add(f)
+
+          for f in sorted(copied):
+              dst = os.path.join('inspect/smali_op', os.path.relpath(f, SRC))
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              shutil.copy(f, dst)
+          print(f"Copied {len(copied)} smali files to inspect/smali_op")
           PY
           wc -l inspect/report.txt
-          head -150 inspect/report.txt
-          echo "---- smali files collected ----"
-          find inspect/smali -type f | head -100
+          cat inspect/report.txt | head -120
 
       - name: Collect resources
-        if: ${{ inputs.run_inspect }}
         run: |
           cd work/src
           cp AndroidManifest.xml ../../inspect/ || true
-          for d in res/layout* res/xml* res/values* res/drawable*; do
+          for d in res/layout* res/xml* res/values*; do
             [ -d "$d" ] && cp -r --parents "$d" ../../inspect/ || true
           done
           cd ../..
           zip -qr inspect.zip inspect
           ls -lh inspect.zip
 
-      - name: Collect account-related smali (small, for token/card analysis)
-        if: ${{ inputs.run_inspect }}
-        run: |
-          mkdir -p account_smali
-          cd work/src
-          # smali uses slashes in class names, so match com/oneplus/account
-          grep -rlE "get_account_o_token|com/oneplus/account|oplustoken|heytap|op_security_uuid" smali* 2>/dev/null \
-            | while read -r f; do cp --parents "$f" ../../account_smali/; done || true
-          cd ../..
-          find account_smali -type f | head -200
-          zip -qr account_smali.zip account_smali || true
-          ls -lh account_smali.zip || true
-
       - name: Upload report
-        if: ${{ inputs.run_inspect }}
         uses: actions/upload-artifact@v4
         with:
           name: inspect
           path: inspect.zip
           if-no-files-found: error
-
-      - name: Upload account smali
-        if: ${{ inputs.run_inspect }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: account-smali
-          path: account_smali.zip
-          if-no-files-found: warn
