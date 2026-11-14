@@ -2,6 +2,7 @@
 """Debug patch for Settings' OPMemberController.
 
  - logs the deviceId that is sent to the OnePlus gateway          (tag OPMemberController, "req deviceId=")
+ - logs whether token / heyTapToken are empty ("req token empty=", "req heyTapToken empty=")
  - logs the full reply of the member request                     (tag OPMemberController, "resp=")
  - with --spoof-deviceid: if the SafeProvider UUID is empty, sends the
    phone's ANDROID_ID instead (experiment: does the server accept a non-empty id?)
@@ -75,6 +76,38 @@ log = '''
     invoke-static {v8, v7}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
 '''
 s = s.replace(old, old + fallback + log)
+
+
+# --- log whether the account tokens that Settings sends are empty (never the values) ---
+def tok_log(label, reg):
+    return f"""
+    invoke-static {{{reg}}}, Landroid/text/TextUtils;->isEmpty(Ljava/lang/CharSequence;)Z
+
+    move-result v7
+
+    new-instance v8, Ljava/lang/StringBuilder;
+
+    invoke-direct {{v8}}, Ljava/lang/StringBuilder;-><init>()V
+
+    const-string v5, "{label}"
+
+    invoke-virtual {{v8, v5}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {{v8, v7}}, Ljava/lang/StringBuilder;->append(Z)Ljava/lang/StringBuilder;
+
+    invoke-virtual {{v8}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+    move-result-object v8
+
+    const-string v5, "OPMemberController"
+
+    invoke-static {{v5, v8}}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+"""
+a = ('    .line 230\n'
+     '    invoke-virtual {p1, v5, v2}, Lorg/json/JSONObject;->put(Ljava/lang/String;Ljava/lang/Object;)Lorg/json/JSONObject;\n')
+once(a, a + tok_log("req token empty=", "v2"))
+b = '    .line 233\n    :cond_3\n'
+once(b, b + tok_log("req heyTapToken empty=", "v3"))
 
 # --- log the reply of the member request ---
 old = ('    invoke-virtual {v4}, Lokhttp3/ResponseBody;->string()Ljava/lang/String;\n\n'
