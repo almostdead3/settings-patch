@@ -1,80 +1,34 @@
-name: Settings member debug patch
+#!/usr/bin/env python3
+"""Make Settings' member card use the India code path.
 
-# Takes Settings.apk from a release of this repo, patches OPMemberController
-# (logs the server reply of the member request) and uploads the result.
-# Only classes2.dex is replaced; everything else (resources, META-INF) stays
-# exactly as in your original APK.
+Why: OPMemberController picks the API by region.
+  isIndia()  -> method "member.app.copywriting.get"   (same API family the Membership app uses; alive)
+  otherwise  -> method "setting.copywriting.get"      (answers "api is circuit breaker" on the port)
+isIndia() comes from OpCustomizeSettings.getSwType() == IN, a device property the port does not have.
 
-on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag that holds Settings.apk (empty = latest release)"
-        required: false
-        default: ""
-      asset:
-        description: "APK file name inside the release"
-        required: true
-        default: "Settings.apk"
-      patch:
-        description: "Patch scripts to apply, in order, space separated (files in the repo root: patch_india.py patch_debug.py patch_member.py)"
-        required: true
-        default: "patch_india.py patch_debug.py"
+This patch removes that SW-type check in the two places where it gates the card
+(OPMemberController.isIndiaShow and OPMemberPreference.isIndia); the check that
+com.oneplus.membership is installed stays.
 
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
+Usage: python3 patch_india.py <decoded Settings dir>
+"""
+import sys, pathlib, re
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Tools (zipalign, zip, apktool)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq zipalign zip unzip binutils
-          curl -fsSL -o apktool.jar \
-            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
-
-      - name: Download Settings.apk from the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            gh release download "${{ inputs.tag }}" -p "${{ inputs.asset }}" -O original.apk
-          else
-            gh release download -p "${{ inputs.asset }}" -O original.apk
-          fi
-          ls -l original.apk
-          unzip -l original.apk | grep -E "classes[0-9]*\.dex"
-
-      - name: Decode (smali only, resources untouched)
-        run: java -jar apktool.jar d -r -f -o dec original.apk
-
-      - name: Apply patch
-        run: |
-          test -f "dec/smali_classes2/com/oneplus/settings/OPMemberController.smali" \
-            || { echo "OPMemberController.smali not found in smali_classes2"; find dec -name 'OPMemberController*.smali'; exit 1; }
-          for p in ${{ inputs.patch }}; do
-            echo "== applying $p"
-            python3 -I "$p" dec
-          done
-
-      - name: Rebuild and swap classes2.dex into the ORIGINAL apk
-        run: |
-          java -jar apktool.jar b -f -o rebuilt.apk dec
-          mkdir x && cd x && unzip -q ../rebuilt.apk "classes2.dex" && cd ..
-          cp original.apk patched.apk
-          # store (no compression) like the original dex entries
-          (cd x && zip -0 -q ../patched.apk classes2.dex)
-          zipalign -p -f 4 patched.apk Settings-patched.apk
-          unzip -p Settings-patched.apk classes2.dex | strings | grep -c -E "req deviceId=|applyLocalFallback|india-patched|const/4" || true
-          ls -l original.apk Settings-patched.apk
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Settings-patched
-          path: Settings-patched.apk
+root = pathlib.Path(sys.argv[1]) / "smali_classes2/com/oneplus/settings"
+targets = [
+    (root / "OPMemberController.smali",  "isIndiaShow"),
+    (root / "ui/OPMemberPreference.smali", "isIndia"),
+]
+call = ("    invoke-static {}, Lcom/oneplus/settings/utils/OPUtils;->isIndia()Z\n\n"
+        "    move-result v0\n")
+for f, name in targets:
+    s = f.read_text()
+    m = re.search(r"\.method private %s\(\)Z.*?\.end method" % name, s, re.S)
+    assert m, f"{name} not found in {f}"
+    body = m.group(0)
+    if "india-patched" in body:
+        print("already patched:", f.name); continue
+    assert body.count(call) == 1, f"unexpected body in {f.name}.{name}"
+    new = body.replace(call, "    # india-patched: ignore SW type, keep the membership-app check\n    const/4 v0, 0x1\n")
+    f.write_text(s.replace(body, new))
+    print("patched", f.name, name)
