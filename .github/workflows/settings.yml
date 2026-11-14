@@ -1,29 +1,33 @@
-name: Settings account header inspect
+name: Settings member debug patch
+
+# Takes Settings.apk from a release of this repo, patches OPMemberController
+# (logs the server reply of the member request) and uploads the result.
+# Only classes2.dex is replaced; everything else (resources, META-INF) stays
+# exactly as in your original APK.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (empty = latest release)"
+        description: "Release tag that holds Settings.apk (empty = latest release)"
         required: false
         default: ""
       asset:
-        description: "APK name in the release assets"
+        description: "APK file name inside the release"
         required: true
         default: "Settings.apk"
-
-permissions:
-  contents: read
-
-env:
-  APKTOOL_VERSION: "2.9.3"
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  ASSET: ${{ inputs.asset }}
-  TAG: ${{ inputs.tag }}
+      patch:
+        description: "Which patch script to apply (file in the repo root)"
+        required: true
+        default: "patch_debug.py"
+        type: choice
+        options:
+          - patch_debug.py
+          - patch_member.py
 
 jobs:
-  inspect:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -32,134 +36,46 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Download APK from this repo's release
+      - name: Tools (zipalign, zip, apktool)
         run: |
-          mkdir -p work
-          if [ -n "$TAG" ]; then
-            gh release download "$TAG" -R "${{ github.repository }}" -p "$ASSET" -D work --clobber
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zipalign zip unzip binutils
+          curl -fsSL -o apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Download Settings.apk from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            gh release download "${{ inputs.tag }}" -p "${{ inputs.asset }}" -O original.apk
           else
-            gh release download -R "${{ github.repository }}" -p "$ASSET" -D work --clobber
+            gh release download -p "${{ inputs.asset }}" -O original.apk
           fi
-          ls -lh work
+          ls -l original.apk
+          unzip -l original.apk | grep -E "classes[0-9]*\.dex"
 
-      - name: Install apktool
+      - name: Decode (smali only, resources untouched)
+        run: java -jar apktool.jar d -r -f -o dec original.apk
+
+      - name: Apply patch
         run: |
-          curl -fL -o apktool.jar \
-            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
-          printf '#!/bin/sh\nexec java -Xmx3g -jar "%s/apktool.jar" "$@"\n' "$PWD" | sudo tee /usr/local/bin/apktool >/dev/null
-          sudo chmod +x /usr/local/bin/apktool
-          apktool --version
+          test -f "dec/smali_classes2/com/oneplus/settings/OPMemberController.smali" \
+            || { echo "OPMemberController.smali not found in smali_classes2"; find dec -name 'OPMemberController*.smali'; exit 1; }
+          python3 -I "${{ inputs.patch }}" dec
 
-      - name: Install ROM framework APKs (optional)
+      - name: Rebuild and swap classes2.dex into the ORIGINAL apk
         run: |
-          # Optional: put framework-res.apk and oplus/oneplus framework APKs in frameworks/
-          if ls frameworks/*.apk >/dev/null 2>&1; then
-            for f in frameworks/*.apk; do apktool if "$f"; done
-          fi
+          java -jar apktool.jar b -f -o rebuilt.apk dec
+          mkdir x && cd x && unzip -q ../rebuilt.apk "classes2.dex" && cd ..
+          cp original.apk patched.apk
+          # store (no compression) like the original dex entries
+          (cd x && zip -0 -q ../patched.apk classes2.dex)
+          zipalign -p -f 4 patched.apk Settings-patched.apk
+          unzip -p Settings-patched.apk classes2.dex | strings | grep -c -E "req deviceId=|applyLocalFallback" || true
+          ls -l original.apk Settings-patched.apk
 
-      - name: Decompile (resources and smali)
-        run: |
-          cd work
-          apktool d "$ASSET" -o src -f
-
-      - name: Find account / member header code
-        run: |
-          mkdir -p inspect/smali_op
-          python3 - <<'PY' > inspect/report.txt
-          import re, glob, os, shutil
-
-          SRC = 'work/src'
-          pub = open(f'{SRC}/res/values/public.xml', errors='ignore').read()
-          ids = {}
-          for typ, name, hid in re.findall(r'<public type="(\w+)" name="([^"]+)" id="(0x[0-9a-fA-F]+)"', pub):
-              ids[(typ, name)] = hid.lower()
-
-          targets = [
-              ('layout',   'op_preference_member'),
-              ('string',   'op_member_title'),
-              ('string',   'op_member_description'),
-              ('string',   'op_oxygen_member_description'),
-              ('string',   'op_china_member_title'),
-              ('string',   'op_china_member_description'),
-              ('string',   'oneplus_member_tag_new'),
-              ('drawable', 'op_ic_member_avatar'),
-              ('drawable', 'op_member_avatar_tag_bg'),
-          ]
-          needles = [
-              'com.oneplus.account', 'get_account_info', 'get_account_o_token',
-              'get_account_oneplus_token', 'SKU_CHINA', 'com.heytap', 'com.oneplus.membership',
-          ]
-
-          smali_files = glob.glob(f'{SRC}/smali*/**/*.smali', recursive=True)
-          texts = {}
-          for f in smali_files:
-              try:
-                  texts[f] = open(f, errors='ignore').read()
-              except OSError:
-                  pass
-          copied = set()
-
-          def scan(label, needle):
-              hits = [f for f, t in texts.items() if needle in t]
-              print(f"--- {label} ({needle}) : {len(hits)} file(s)")
-              for f in hits[:40]:
-                  print("   ", f.replace(SRC + '/', ''))
-              if len(hits) <= 40:
-                  copied.update(hits)
-
-          print("=== 1. Resource ids used by the account/member card ===")
-          for typ, name in targets:
-              print(f"{typ}/{name} = {ids.get((typ, name), 'NOT FOUND')}")
-          print()
-          print("=== 2. Smali files that use those ids ===")
-          for typ, name in targets:
-              hid = ids.get((typ, name))
-              if hid:
-                  scan(f"{typ}/{name}", hid)
-          print()
-          print("=== 3. Smali files mentioning account provider / China SKU / HeyTap ===")
-          for n in needles:
-              scan("string", n)
-          print()
-
-          # when the APK is the OnePlus Account app, also take its provider / auth / util code whole
-          for sub in ['provider', 'util', 'data', 'authenticator', 'tokenauth', 'oneplush']:
-              for f in glob.glob(f'{SRC}/smali*/com/oneplus/account/{sub}/**/*.smali', recursive=True):
-                  copied.add(f)
-
-          for f in glob.glob(f'{SRC}/smali*/com/oneplus/accountsdk/utils/*.smali'):
-              copied.add(f)
-
-          # when the APK is Settings: the account / member card at the top of the settings list
-          for pattern in ['com/oneplus/settings/**/*Member*.smali',
-                          'com/oneplus/settings/**/*Account*.smali',
-                          'com/oneplus/settings/utils/OPUtils*.smali']:
-              for f in glob.glob(f'{SRC}/smali*/{pattern}', recursive=True):
-                  copied.add(f)
-
-          for f in sorted(copied):
-              dst = os.path.join('inspect/smali_op', os.path.relpath(f, SRC))
-              os.makedirs(os.path.dirname(dst), exist_ok=True)
-              shutil.copy(f, dst)
-          print(f"Copied {len(copied)} smali files to inspect/smali_op")
-          PY
-          wc -l inspect/report.txt
-          cat inspect/report.txt | head -120
-
-      - name: Collect resources
-        run: |
-          cd work/src
-          cp AndroidManifest.xml ../../inspect/ || true
-          for d in res/layout* res/xml* res/values*; do
-            [ -d "$d" ] && cp -r --parents "$d" ../../inspect/ || true
-          done
-          cd ../..
-          zip -qr inspect.zip inspect
-          ls -lh inspect.zip
-
-      - name: Upload report
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: inspect
-          path: inspect.zip
-          if-no-files-found: error
+          name: Settings-patched
+          path: Settings-patched.apk
